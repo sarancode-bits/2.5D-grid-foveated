@@ -42,6 +42,8 @@ try:
 except ImportError:  # pragma: no cover
     cv2 = None
 
+from multi_object_tracker import MultiObjectTracker
+
 # ---------------------------------------------------------------------------
 # Labels that matter in an automotive driving corridor.
 # ---------------------------------------------------------------------------
@@ -64,8 +66,16 @@ LABEL_COLORS = {
 # ---------------------------------------------------------------------------
 # Range band (monocular perspective heuristic, matches the HUD 3-ring design).
 # ---------------------------------------------------------------------------
-def classify_range(box, frame_w, frame_h, roi_min_y=0.35, roi_max_y=0.85):
-    """Return 'near' | 'mid' | 'far' from box size + vertical position."""
+def classify_range(box, frame_w, frame_h, roi_min_y=0.35, roi_max_y=0.85, lidar_depth_m=None):
+    """Return 'near' | 'mid' | 'far' from true LiDAR depth (if available) or box size."""
+    if lidar_depth_m is not None:
+        if lidar_depth_m <= 10.0:
+            return "near"
+        elif lidar_depth_m <= 30.0:
+            return "mid"
+        else:
+            return "far"
+
     x, y, w, h = box
     bottom = y + h
     rel_bottom = bottom / max(1, frame_h)
@@ -171,30 +181,7 @@ def detect_vehicle_parts(bgr_crop):
 # This is what lets the dashboard track EACH AND EVERY person in front of the
 # camera instead of the single largest motion blob.
 # ---------------------------------------------------------------------------
-class ObjectTrack:
-    __slots__ = ("id", "label", "conf", "box", "parts", "range_band",
-                 "last_seen", "smooth_box")
-
-    def __init__(self, track_id, det):
-        self.id = track_id
-        self.label = det.get("label", "object")
-        self.conf = det.get("conf", 0.5)
-        self.box = [float(v) for v in det["box"]]
-        self.parts = det.get("parts", [])
-        self.range_band = det.get("range_band", "mid")
-        self.last_seen = time.time()
-        self.smooth_box = list(self.box)
-
-    def update(self, det, now=None):
-        self.label = det.get("label", self.label)
-        self.conf = det.get("conf", self.conf)
-        self.parts = det.get("parts", [])
-        self.range_band = det.get("range_band", self.range_band)
-        box = [float(v) for v in det["box"]]
-        for i in range(4):
-            self.smooth_box[i] += (box[i] - self.smooth_box[i]) * 0.55
-        self.box = [float(v) for v in self.smooth_box]
-        self.last_seen = now if now is not None else time.time()
+# The old ObjectTrack class was removed in Phase 2 in favor of KalmanBoxTracker
 
 
 def _iou(a, b):
@@ -327,57 +314,7 @@ def _group_by_label(dets):
     return out
 
 
-class MultiObjectTracker:
-    """Assigns stable IDs across frames to every detected object."""
-
-    def __init__(self, max_age=0.6, iou_thresh=0.08):
-        self.tracks = OrderedDict()
-        self.next_id = 1
-        self.max_age = max_age
-        self.iou_thresh = iou_thresh
-        self.frame_no = 0
-
-    def reset(self):
-        self.tracks.clear()
-        self.next_id = 1
-        self.frame_no = 0
-
-    def update(self, detections, now=None):
-        self.frame_no += 1
-        now = now if now is not None else time.time()
-        dets = [d for d in detections if d.get("box")]
-        matched = set()
-        out = []
-        for tid, tr in list(self.tracks.items()):
-            best, best_score = None, self.iou_thresh
-            for i, d in enumerate(dets):
-                if i in matched:
-                    continue
-                score = _iou(tr.box, d["box"])
-                if score > best_score:
-                    best, best_score = i, score
-            if best is not None:
-                matched.add(best)
-                tr.update(dets[best], now)
-                out.append(self._emit(tr))
-            elif now - tr.last_seen > self.max_age:
-                del self.tracks[tid]
-        for i, d in enumerate(dets):
-            if i in matched:
-                continue
-            tr = ObjectTrack(self.next_id, d)
-            self.next_id += 1
-            self.tracks[tr.id] = tr
-            out.append(self._emit(tr))
-        return out
-
-    @staticmethod
-    def _emit(tr):
-        return {
-            "id": tr.id, "label": tr.label, "conf": round(tr.conf, 3),
-            "box": [round(float(v), 1) for v in tr.box],
-            "parts": tr.parts, "range_band": tr.range_band,
-        }
+# The old MultiObjectTracker class was removed in Phase 2 in favor of multi_object_tracker.py
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +330,8 @@ class SemanticDetector:
         self.model = None
         self.hog = None
         self.backend_name = None
-        self.tracker = MultiObjectTracker()
+        self.tracker = MultiObjectTracker(max_age=15, min_hits=1)
+        self.weather_active = False
         self._prev_gray = None
         if backend != "cv-cascade":
             self._init_deep_backend()
@@ -588,9 +526,11 @@ class SemanticDetector:
                                 continue
                             conf = float(r.boxes.conf[i].item())
                             x1, y1, x2, y2 = r.boxes.xyxy[i].tolist()
+                            x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
                             dets.append({
                                 "label": label, "conf": conf,
-                                "box": [x1, y1, x2 - x1, y2 - y1],
+                                "box": [x, y, w, h],
+                                "bbox": [x, y, x + w, y + h], # Added for Kalman tracker
                                 "parts": []})
                 elif self.backend_name == "yolov5s":
                     results = self.model(frame_bgr)
@@ -623,19 +563,50 @@ class SemanticDetector:
             dets = self._cv_cascade(frame_bgr)
 
         # Shape analysis + range band for every detection.
+        import random
+        degraded_dets = []
         for d in dets:
+            if getattr(self, "weather_active", False):
+                d["conf"] *= 0.55
+                if random.random() < 0.40: # 40% chance YOLO entirely misses object in dense fog
+                    continue
+            
             x, y, w, h = [int(v) for v in d["box"]]
             x, y = max(0, x), max(0, y)
             crop = frame_bgr[y:y + h, x:x + w]
             if d["label"] in VEHICLE_LABELS:
                 d["parts"] = detect_vehicle_parts(crop)
             d["range_band"] = classify_range(d["box"], fw, fh)
-        return dets
+            degraded_dets.append(d)
+        return degraded_dets
 
     def detect_and_track(self, frame_bgr):
         """Detect then assign stable IDs -> one track per object per frame."""
         dets = self.detect(frame_bgr)
-        return self.tracker.update(dets)
+        # Ensure 'bbox' (x1, y1, x2, y2) is present for the new tracker
+        for d in dets:
+            if "bbox" not in d and "box" in d:
+                x, y, w, h = d["box"]
+                d["bbox"] = [x, y, x + w, y + h]
+        
+        tracked = self.tracker.update(dets)
+        
+        # Convert output back to the format expected by the dashboard
+        # Tracker outputs "bbox" [x1, y1, x2, y2], we need "box" [x, y, w, h] and "id" instead of "track_id"
+        out = []
+        for t in tracked:
+            x1, y1, x2, y2 = t["bbox"]
+            t_copy = dict(t)
+            t_copy["box"] = [x1, y1, x2 - x1, y2 - y1]
+            t_copy["id"] = t.get("track_id", 0)
+            
+            # preserve original label/conf/parts keys passed through the tracker
+            if "parts" not in t_copy:
+                t_copy["parts"] = []
+                
+            out.append(t_copy)
+            
+        return out
 
 
 def _draw_annotations(frame, objects):
@@ -646,9 +617,16 @@ def _draw_annotations(frame, objects):
             color = (200, 120, 60)
         elif obj["label"] == "person":
             color = (0, 200, 120)
-        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-        cv2.putText(frame, f"{obj['label']} {obj['conf']:.2f} #{obj['id']}",
-                    (x, max(0, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+        cv2.rectangle(frame, (int(x), int(y)), (int(x + w), int(y + h)), color, 2)
+        
+        # Build text string (add velocity if available)
+        text = f"{obj['label']} {obj.get('conf', 0):.2f} #{obj.get('id', obj.get('track_id', 0))}"
+        if "velocity_px_s" in obj:
+            vx, vy = obj["velocity_px_s"]
+            text += f" v=({vx:.1f},{vy:.1f})"
+            
+        cv2.putText(frame, text,
+                    (int(x), max(0, int(y) - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     color, 1)
         for p in obj.get("parts", []):
             px, py = int(x + p["cx"]), int(y + p["cy"])

@@ -378,6 +378,9 @@ class SemanticVision {
                     box: o.box,
                     parts: o.parts || [],
                     range_band: o.range_band || 'mid',
+                    lidar_depth_m: o.lidar_depth_m,
+                    velocity_px_s: o.velocity_px_s,
+                    bbox3d: o.bbox3d
                 }));
                 if (msg.backend) this.backend = msg.backend;
                 if (msg.infer_ms !== undefined) this.inferMs = msg.infer_ms;
@@ -672,6 +675,13 @@ class UnifiedTeleopEngine {
     init() {
         this.resize();
         window.addEventListener('resize', () => this.resize());
+        
+        window.addEventListener('weatherToggled', (e) => {
+            if (this.semanticVision && this.semanticVision.ws && this.semanticVision.ws.readyState === WebSocket.OPEN) {
+                this.semanticVision.ws.send(JSON.stringify({ cmd: 'set_weather', active: e.detail }));
+            }
+        });
+        
         this.setViewMode(this.viewMode);
         this.startLoop();
     }
@@ -1097,6 +1107,11 @@ class UnifiedTeleopEngine {
         let objects = [];
         let backend = null;
         if (sv.status === 'online') {
+            // Phase 3 to Phase 1: Send LiDAR point cloud to Vision Server for Fusion
+            if (window.threeSim && typeof window.threeSim.getLidarPointCloud === 'function') {
+                const lidarPoints = window.threeSim.getLidarPointCloud();
+                sv._sendText({ cmd: 'lidar', points: lidarPoints });
+            }
             sv.sendFrame(imgData.data, sendW, sendH);
             objects = sv.lastObjects;
             backend = sv.backend || 'yolo';
@@ -1117,6 +1132,9 @@ class UnifiedTeleopEngine {
                 conf: o.conf,
                 parts: o.parts || [],
                 range_band: o.range_band || 'mid',
+                lidar_depth_m: o.lidar_depth_m,
+                velocity_px_s: o.velocity_px_s,
+                bbox3d: o.bbox3d,
                 box: [w - (sb[0] + sb[2]) * kx, sb[1] * ky, sb[2] * kx, sb[3] * ky],
                 _sendBox: sb,
             });
@@ -1288,36 +1306,75 @@ class UnifiedTeleopEngine {
         // Point Cloud Generation - In Stationary Mode, points remain FIXED relative to ground!
         // Legend mapping (Semantic Ring Legend): ground #34d399, near #38bdf8,
         // mid #c084fc, far #fb923c, dynamic obstacle #f43f5e.
-        const numPoints = Math.min(600, Math.floor(this.pointDensity / 150));
-        const rotationAngle = (this.motionMode === 'circular') ? (this.frame * 0.005) : 0; // NO spinning in stationary mode!
+        let lidarPoints = [];
+        if (this.cameraSource === 'simulator' && window.threeSim) {
+            // Phase 3: Get real structured LiDAR scan from 3D physics engine
+            lidarPoints = window.threeSim.getLidarPointCloud();
+        }
 
-        for (let i = 0; i < numPoints; i++) {
-            const seed = (i * 9301 + 49297) % 233280;
-            const norm = seed / 233280.0;
-            const dist = norm * 100;
-            const angle = ((i * 137.5) % 360) * (Math.PI / 180) + rotationAngle;
+        if (lidarPoints.length > 0) {
+            // Render REAL LiDAR scan points
+            const ego = window.threeSim.ego;
+            const fwdX = -Math.sin(ego.yaw);
+            const fwdZ = -Math.cos(ego.yaw);
+            const rightX = -fwdZ;
+            const rightZ = fwdX;
 
-            const px = cx + Math.cos(angle) * dist * scale * 2;
-            const py = cy + Math.sin(angle) * dist * scale * 2;
-
-            if (dist <= 10) {
-                // Near field: drivable ground surface (green) with cyan ring markers
-                // interleaved so BOTH legend entries are visible in the 3-ring grid.
-                if (i % 3 === 0) {
-                    ctx.fillStyle = '#34d399';
+            for (const pt of lidarPoints) {
+                // pt is [X, Y, Z] in KITTI space (X=forward, Y=left, Z=up)
+                // Convert to Three.js space for BEV rendering
+                const ptX = -pt[1]; // Three X (right) = -KITTI Y (left)
+                const ptZ = -pt[0]; // Three Z (back) = -KITTI X (forward)
+                
+                const dx = ptX - ego.x;
+                const dz = ptZ - ego.z;
+                const localFwd = dx * fwdX + dz * fwdZ;
+                const localRight = dx * rightX + dz * rightZ;
+                
+                const dist = Math.hypot(dx, dz);
+                const px = cx + localRight * scale * 2;
+                const py = cy - localFwd * scale * 2;
+                
+                if (dist <= 10) {
+                    ctx.fillStyle = '#38bdf8';
+                    ctx.fillRect(px - 1, py - 1, 2, 2);
+                } else if (dist <= 30) {
+                    ctx.fillStyle = '#c084fc';
                     ctx.fillRect(px - 1, py - 1, 2, 2);
                 } else {
-                    ctx.fillStyle = '#38bdf8';
-                    ctx.fillRect(px - 1.5, py - 1.5, 3, 3);
+                    ctx.fillStyle = '#fb923c';
+                    ctx.fillRect(px - 0.5, py - 0.5, 1, 1);
                 }
-            } else if (dist <= 30) {
-                // Mid Ring (15cm resolution) — matches legend #c084fc
-                ctx.fillStyle = '#c084fc';
-                ctx.fillRect(px - 1, py - 1, 2, 2);
-            } else {
-                // Far Ring (50cm resolution) — matches legend #fb923c
-                ctx.fillStyle = '#fb923c';
-                ctx.fillRect(px - 0.5, py - 0.5, 1, 1);
+            }
+        } else {
+            // Fallback: Synthetic random points
+            const numPoints = Math.min(600, Math.floor(this.pointDensity / 150));
+            const rotationAngle = (this.motionMode === 'circular') ? (this.frame * 0.005) : 0; // NO spinning in stationary mode!
+
+            for (let i = 0; i < numPoints; i++) {
+                const seed = (i * 9301 + 49297) % 233280;
+                const norm = seed / 233280.0;
+                const dist = norm * 100;
+                const angle = ((i * 137.5) % 360) * (Math.PI / 180) + rotationAngle;
+
+                const px = cx + Math.cos(angle) * dist * scale * 2;
+                const py = cy + Math.sin(angle) * dist * scale * 2;
+
+                if (dist <= 10) {
+                    if (i % 3 === 0) {
+                        ctx.fillStyle = '#34d399';
+                        ctx.fillRect(px - 1, py - 1, 2, 2);
+                    } else {
+                        ctx.fillStyle = '#38bdf8';
+                        ctx.fillRect(px - 1.5, py - 1.5, 3, 3);
+                    }
+                } else if (dist <= 30) {
+                    ctx.fillStyle = '#c084fc';
+                    ctx.fillRect(px - 1, py - 1, 2, 2);
+                } else {
+                    ctx.fillStyle = '#fb923c';
+                    ctx.fillRect(px - 0.5, py - 0.5, 1, 1);
+                }
             }
         }
 
@@ -1584,10 +1641,9 @@ class UnifiedTeleopEngine {
             ctx.restore();
         });
 
-        // Draw Ego Vehicle Symbol
+        // Draw Ego Vehicle Symbol (Fixed Ego-Centric, always points straight UP)
         ctx.save();
         ctx.translate(cx, cy);
-        ctx.rotate(this.yaw);
 
         ctx.fillStyle = '#ffffff';
         ctx.beginPath();
@@ -1745,6 +1801,28 @@ class UnifiedTeleopEngine {
             targetList = window.threeSim.getDetectedObjects();
         } else if (this.cameraSource === 'synthetic') {
             targetList = this._getSyntheticDetectedObjects(w, h);
+        } else if (this.cameraSource === 'webcam' && this.semanticVisionActive) {
+            targetList = this.semanticObjects.map(o => {
+                const bw = o.box[2];
+                const bh = o.box[3];
+                const cx = (o.box[0] + bw / 2) / w;
+                const cy = (o.box[1] + bh / 2) / h;
+                
+                return {
+                    label: o.label,
+                    dist: o.lidar_depth_m || 12.0,
+                    confidence: o.conf || 0.5,
+                    box: { x: cx, y: cy, w: bw, h: bh },
+                    velocity: o.velocity_px_s,
+                    id: o.id,
+                    bbox3d: o.bbox3d
+                };
+            });
+        }
+
+        // Phase 5: Pass 3D bounding boxes to the simulator for rendering
+        if (window.threeSim && typeof window.threeSim.renderBBox3D === 'function') {
+            window.threeSim.renderBBox3D(targetList);
         }
 
         if (targetList.length > 0) {
@@ -1779,7 +1857,40 @@ class UnifiedTeleopEngine {
                 }
 
                 // High-priority alert overlays & semantic vegetation coloring
-                if (isPed && dist <= 10.0) {
+                let isCriticalTTC = false;
+                
+                // TTC Calculation
+                if (d.id !== undefined && !isTree && !isPothole) {
+                    if (!this._distHistory) this._distHistory = {};
+                    const now = performance.now();
+                    const hist = this._distHistory[d.id];
+                    if (hist) {
+                        const dt = (now - hist.time) / 1000.0;
+                        if (dt > 0.1) {
+                            const relVel = (hist.dist - dist) / dt; // positive if coming closer
+                            hist.vel = hist.vel * 0.7 + relVel * 0.3; // EMA smoothing
+                            hist.dist = dist;
+                            hist.time = now;
+                        }
+                        if (hist.vel > 1.0) { // Moving closer at > 1.0 m/s
+                            const ttc = dist / hist.vel;
+                            if (ttc > 0 && ttc < 2.5) {
+                                isCriticalTTC = true;
+                                d.ttc = ttc;
+                            }
+                        }
+                    } else {
+                        this._distHistory[d.id] = { dist: dist, time: now, vel: 0 };
+                    }
+                }
+                
+                // Flashing red state for critical TTC
+                const blink = Math.floor(performance.now() / 150) % 2 === 0;
+                
+                if (isCriticalTTC && blink) {
+                    strokeColor = '#ef4444'; // Bright Red
+                    fillColor = 'rgba(239, 68, 68, 0.4)';
+                } else if (isPed && dist <= 10.0) {
                     strokeColor = '#f43f5e';
                     fillColor = 'rgba(244, 63, 94, 0.22)';
                 } else if (isPothole) {
@@ -1825,13 +1936,26 @@ class UnifiedTeleopEngine {
 
                 // Top Header Badge
                 ctx.fillStyle = 'rgba(2, 6, 23, 0.88)';
-                let tag = `🚗 VEHICLE | ${ringName.split(' ')[0]} ${dist.toFixed(1)}m | ${(d.confidence * 100).toFixed(0)}%`;
+                let idStr = d.id !== undefined ? `[ID:${d.id}] ` : '';
+                let tag = `${idStr}🚗 VEHICLE | ${ringName.split(' ')[0]} ${dist.toFixed(1)}m | ${(d.confidence * 100).toFixed(0)}%`;
                 if (isPed) {
-                    tag = `🚶 PEDESTRIAN | ${ringName.split(' ')[0]} ${dist.toFixed(1)}m | ${(d.confidence * 100).toFixed(0)}%`;
+                    tag = `${idStr}🚶 PEDESTRIAN | ${ringName.split(' ')[0]} ${dist.toFixed(1)}m | ${(d.confidence * 100).toFixed(0)}%`;
                 } else if (isPothole) {
                     tag = `🕳️ POTHOLE | -12cm DEPTH | ${dist.toFixed(1)}m`;
                 } else if (isTree) {
                     tag = `🌲 VEGETATION (STATIC MASK) • ${dist.toFixed(1)}m`;
+                }
+                
+                // Add velocity reading if available
+                let vMag = 0;
+                if (d.velocity && (Math.abs(d.velocity[0]) > 0.1 || Math.abs(d.velocity[1]) > 0.1)) {
+                    vMag = Math.hypot(d.velocity[0], d.velocity[1]);
+                    tag += ` | v=${vMag.toFixed(0)}px/s`;
+                }
+                
+                if (isCriticalTTC && blink) {
+                    tag = `⚠️ CRITICAL COLLISION WARNING | TTC: ${d.ttc.toFixed(1)}s`;
+                    ctx.fillStyle = '#ef4444';
                 }
 
                 ctx.font = 'bold 10px JetBrains Mono, monospace';
@@ -1846,7 +1970,8 @@ class UnifiedTeleopEngine {
 
                 // Bottom Range Badge (Only for dynamic actors like pedestrians, cars, and road hazards, NOT for trees!)
                 if (!isTree) {
-                    let rangePill = `RANGE: ${dist.toFixed(1)}m • ${ringRes}`;
+                    let sourcePrefix = (this.cameraSource === 'webcam' && this.semanticVisionActive) ? 'LiDAR DEPTH' : 'RANGE';
+                    let rangePill = `${sourcePrefix}: ${dist.toFixed(1)}m • ${ringRes}`;
                     if (isPothole) {
                         rangePill = `2.5D ELEVATION DEFICIT: -12cm • ${dist.toFixed(1)}m`;
                     }
@@ -1859,6 +1984,32 @@ class UnifiedTeleopEngine {
                     ctx.strokeRect(bx, pillY, pillW, 18);
                     ctx.fillStyle = '#f8fafc';
                     ctx.fillText(rangePill, bx + 6, pillY + 13);
+                }
+                
+                // Draw velocity vector arrow (Phase 2)
+                if (d.velocity && vMag > 5.0) {
+                    const cx = bx + bw / 2;
+                    const cy = by + bh / 2;
+                    // Scale velocity for visualization (e.g., 0.5 sec prediction)
+                    const vx = d.velocity[0] * 0.5;
+                    const vy = d.velocity[1] * 0.5;
+                    
+                    ctx.beginPath();
+                    ctx.moveTo(cx, cy);
+                    ctx.lineTo(cx + vx, cy + vy);
+                    ctx.strokeStyle = '#fde047'; // bright yellow
+                    ctx.lineWidth = 2.5;
+                    ctx.stroke();
+                    
+                    // Arrowhead
+                    const angle = Math.atan2(vy, vx);
+                    ctx.beginPath();
+                    ctx.moveTo(cx + vx, cy + vy);
+                    ctx.lineTo(cx + vx - 8 * Math.cos(angle - Math.PI / 6), cy + vy - 8 * Math.sin(angle - Math.PI / 6));
+                    ctx.lineTo(cx + vx - 8 * Math.cos(angle + Math.PI / 6), cy + vy - 8 * Math.sin(angle + Math.PI / 6));
+                    ctx.closePath();
+                    ctx.fillStyle = '#fde047';
+                    ctx.fill();
                 }
             });
         }

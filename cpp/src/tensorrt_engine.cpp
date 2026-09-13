@@ -34,8 +34,7 @@ TensorRTEngine::~TensorRTEngine() {}
     out.close();
 
     std::cout << "  - Output Saved ..." << "\n";
-    std::cout << "  [SUCCESS] TensorRT engine compiled.
-";
+    std::cout << "  [SUCCESS] TensorRT engine compiled.\n";
     is_loaded_ = true;
     return true;
   }

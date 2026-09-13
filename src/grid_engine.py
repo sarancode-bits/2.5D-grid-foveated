@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from motion_compensation import undistort_scan
+
 from ring_buffer import MultiLevelRingBuffer, RING_CONFIGS, RingConfig
 from grid_blending import GridBlendingEngine
 from grid_cell import SurfacePatch
@@ -80,6 +82,7 @@ class FoveatedGridEngine:
         sem_classes: Optional[np.ndarray] = None,
         confidences: Optional[np.ndarray] = None,
         ground_mask: Optional[np.ndarray] = None,
+        ego_velocity: Optional[Tuple[float, float, float]] = None,
     ) -> Dict[int, int]:
         """Insert a classified point cloud into the foveated ring buffer grid.
 
@@ -93,6 +96,8 @@ class FoveatedGridEngine:
             Classification confidence per point (0.0 to 1.0).
         ground_mask : np.ndarray[bool], shape (N,)
             Ground mask from segment_ground(). True = ground.
+        ego_velocity : tuple (vx, vy, yaw_rate), optional
+            Vehicle velocity for motion distortion correction.
 
         Returns
         -------
@@ -105,6 +110,11 @@ class FoveatedGridEngine:
         N = points.shape[0]
         if N == 0:
             return {0: 0, 1: 0, 2: 0}
+
+        # Apply motion distortion correction if velocity is provided (Phase 4)
+        if ego_velocity is not None:
+            vx, vy, yaw_rate = ego_velocity
+            points = undistort_scan(points, vx, vy, yaw_rate)
 
         xyz = points[:, :3]
 

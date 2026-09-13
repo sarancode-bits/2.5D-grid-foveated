@@ -38,6 +38,7 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 from semantic_detector import (SemanticDetector, VEHICLE_LABELS)  # noqa: E402
+from sensor_fusion import SensorFusionEngine  # noqa: E402
 
 try:
     import cv2
@@ -72,6 +73,8 @@ class VisionServer:
         self.conf_threshold = conf_threshold
         self.detector = SemanticDetector(backend=backend, model_path=model_path,
                                          conf_threshold=conf_threshold)
+        self.fusion = SensorFusionEngine()  # Loads default calibration
+        self._last_lidar_points = None
         self._last_frame_at = time.time()
         self._fps_ema = 0.0
         self._frame_no = 0
@@ -120,10 +123,21 @@ class VisionServer:
                         "type": "pong", "backend": self.detector.backend_name}))
                 elif cmd.get("cmd") == "set_conf":
                     self.conf_threshold = float(cmd.get("value", 0.30))
+                elif cmd.get("cmd") == "lidar":
+                    pts = cmd.get("points", [])
+                    if pts:
+                        self._last_lidar_points = np.array(pts, dtype=np.float32)
+                elif cmd.get("cmd") == "set_weather":
+                    self.detector.weather_active = bool(cmd.get("active", False))
 
     def process_frame(self, frame_bgr):
         t0 = time.time()
         objs = self.detector.detect_and_track(frame_bgr)
+        
+        # Phase 1: LiDAR-Camera Sensor Fusion
+        if self._last_lidar_points is not None and len(self._last_lidar_points) > 0:
+            objs = self.fusion.fuse_detections(self._last_lidar_points, objs)
+            
         infer_ms = (time.time() - t0) * 1e3
         self._frame_no += 1
         now = time.time()

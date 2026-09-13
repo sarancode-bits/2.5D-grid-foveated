@@ -18,6 +18,7 @@ Each ClusterInfo dict contains:
         "centroid": np.ndarray, # (3,) cluster centroid
         "bbox_min": np.ndarray, # (3,) axis-aligned bounding box min
         "bbox_max": np.ndarray, # (3,) axis-aligned bounding box max
+        "bbox3d": dict,        # 7-DOF oriented 3D bounding box
     }
 
 Usage:
@@ -85,6 +86,7 @@ def classify_clusters(
     """
     from clustering import cluster_points
     from feature_extraction import extract_features
+    from bbox3d_estimator import estimate_3d_bbox
 
     t0 = time.perf_counter()
 
@@ -128,6 +130,9 @@ def classify_clusters(
         centroid = cluster_pts[:, :3].mean(axis=0)
         bbox_min = cluster_pts[:, :3].min(axis=0)
         bbox_max = cluster_pts[:, :3].max(axis=0)
+        
+        # Estimate 3D oriented bounding box (Phase 5)
+        bbox3d_obj = estimate_3d_bbox(cluster_pts)
 
         results.append({
             "cluster_id": cid,
@@ -138,6 +143,7 @@ def classify_clusters(
             "centroid": centroid,
             "bbox_min": bbox_min,
             "bbox_max": bbox_max,
+            "bbox3d": bbox3d_obj.to_dict(),
         })
 
     elapsed_ms = (time.perf_counter() - t0) * 1000

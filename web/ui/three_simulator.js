@@ -1822,6 +1822,15 @@
                         this.autopilot = !this.autopilot;
                         this._updateDrivingHud();
                         break;
+                    case 'KeyR':
+                        this.weatherActive = !this.weatherActive;
+                        this.scene.fog.density = this.weatherActive ? 0.045 : 0.0012;
+                        this.scene.background = new THREE.Color(this.weatherActive ? 0x94a3b8 : 0x7dd3fc);
+                        
+                        // Send weather state to backend if possible (handled in teleop_dashboard)
+                        const event = new CustomEvent('weatherToggled', { detail: this.weatherActive });
+                        window.dispatchEvent(event);
+                        break;
                     case 'KeyC':
                         this.cycleCameraMode();
                         break;
@@ -2540,6 +2549,83 @@
             return this.canvas;
         }
 
+        getLidarPointCloud() {
+            // Phase 3: Structured 32-beam LiDAR scan with raycasting and noise
+            if (!this.ego.mesh) return [];
+            
+            // Frame-level caching
+            if (this._lastLidarSimFrame === this.simFrame && this._cachedLidarPoints) {
+                return this._cachedLidarPoints;
+            }
+            
+            const points = [];
+            const egoPos = this.ego.mesh.position.clone();
+            egoPos.y += 1.8; // Sensor height
+            const egoYaw = this.ego.yaw;
+
+            const raycaster = new THREE.Raycaster();
+            raycaster.near = 0.5;
+            raycaster.far = 80.0;
+            raycaster.camera = this.userCamera; // Fixes crash when raycasting against THREE.Sprite
+            
+            // 32 beams, -15 to +15 degrees
+            const beams = 32;
+            const horizRes = 360; // 1 degree horizontal resolution
+            
+            for (let b = 0; b < beams; b++) {
+                const pitch = THREE.MathUtils.degToRad(-15 + (30 * b / (beams - 1)));
+                const cosPitch = Math.cos(pitch);
+                const sinPitch = Math.sin(pitch);
+                
+                for (let h = 0; h < horizRes; h++) {
+                    const yaw = egoYaw + THREE.MathUtils.degToRad(h * (360 / horizRes));
+                    
+                    const dir = new THREE.Vector3(
+                        -Math.sin(yaw) * cosPitch,
+                        sinPitch,
+                        -Math.cos(yaw) * cosPitch
+                    );
+                    
+                    raycaster.set(egoPos, dir);
+                    // Raycast against scene objects
+                    const intersects = raycaster.intersectObjects(this.scene.children, true);
+                    
+                    if (intersects.length > 0) {
+                        let hit = null;
+                        for (const inter of intersects) {
+                            if (inter.object !== this.ego.mesh && 
+                                inter.object.name !== "lidar_puck" && 
+                                inter.object.name !== "lidar_sweep" &&
+                                inter.object.type === 'Mesh') {
+                                hit = inter;
+                                break;
+                            }
+                        }
+                        
+                        if (hit && hit.distance < 80.0) {
+                            // Phase 3: Sensor noise injection (Gaussian-ish distance error + random ray drops)
+                            if (Math.random() < 0.015) continue; // 1.5% ray drop
+                            
+                            const noise = (Math.random() + Math.random() - 1.0) * 0.03; // +/- 3cm noise
+                            const pt = egoPos.clone().add(dir.multiplyScalar(hit.distance + noise));
+                            
+                            // Transform from Three.js World (X=right, Y=up, Z=back)
+                            // to KITTI LiDAR (X=forward, Y=left, Z=up)
+                            // This ensures Python backend bbox3d_estimator and sensor_fusion work correctly.
+                            const kittiX = -pt.z;
+                            const kittiY = -pt.x;
+                            const kittiZ = pt.y;
+                            
+                            points.push([kittiX, kittiY, kittiZ]);
+                        }
+                    }
+                }
+            }
+            this._lastLidarSimFrame = this.simFrame;
+            this._cachedLidarPoints = points;
+            return points;
+        }
+
         getDetectedObjects() {
             // Frame-level caching: Return existing calculation if called multiple times in the same simulation tick
             if (this._lastDetectedSimFrame === this.simFrame && this._cachedDetected) {
@@ -2690,6 +2776,48 @@
             this._lastDetectedSimFrame = this.simFrame;
             this._cachedDetected = results;
             return results;
+        }
+
+        renderBBox3D(targetList) {
+            // Phase 5: Render oriented 3D wireframe boxes
+            if (!this.bboxGroup) {
+                this.bboxGroup = new THREE.Group();
+                this.scene.add(this.bboxGroup);
+            }
+            
+            // Clear previous frames boxes
+            while(this.bboxGroup.children.length > 0) { 
+                const child = this.bboxGroup.children[0];
+                this.bboxGroup.remove(child);
+                if (child.geometry) child.geometry.dispose();
+                if (child.material) child.material.dispose();
+            }
+
+            if (!targetList || targetList.length === 0) return;
+
+            for (const t of targetList) {
+                if (!t.bbox3d) continue;
+                const b = t.bbox3d;
+                
+                // Create wireframe box
+                const geometry = new THREE.BoxGeometry(b.width, b.height, b.length);
+                const edges = new THREE.EdgesGeometry(geometry);
+                
+                let color = 0x38bdf8; // Cyan for vehicle
+                if (t.label === 'person') color = 0x4ade80; // Green for person
+                else if (t.label === 'pothole') color = 0xf43f5e; // Red for pothole
+                
+                const material = new THREE.LineBasicMaterial({ color: color, linewidth: 2 });
+                const wireframe = new THREE.LineSegments(edges, material);
+                
+                // Position and orient from KITTI (X=fwd, Y=left, Z=up) to Three.js (X=right, Y=up, Z=back)
+                wireframe.position.set(-b.cy, b.cz, -b.cx);
+                
+                // Yaw is around the Y axis in Three.js (up)
+                wireframe.rotation.y = b.yaw; 
+                
+                this.bboxGroup.add(wireframe);
+            }
         }
 
         resize(width, height) {

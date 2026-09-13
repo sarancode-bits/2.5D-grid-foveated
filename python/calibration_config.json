@@ -1,0 +1,23 @@
+{
+    "description": "LiDAR-Camera Extrinsic/Intrinsic Calibration Parameters",
+    "notes": "Defaults are KITTI-like values. Replace with your sensor's actual calibration.",
+
+    "intrinsic_K": [
+        [718.856,   0.0,   607.1928],
+        [  0.0,   718.856, 185.2157],
+        [  0.0,     0.0,     1.0   ]
+    ],
+
+    "extrinsic_rotation": [
+        [ 0.9999,  0.0098, -0.0074],
+        [-0.0099,  0.9999, -0.0044],
+        [ 0.0074,  0.0045,  0.9999]
+    ],
+    "extrinsic_translation": [0.0, -0.08, -0.27],
+
+    "image_width": 1242,
+    "image_height": 375,
+
+    "sensor_height_m": 1.73,
+    "lidar_position_offset": [0.0, 0.0, 1.73]
+}

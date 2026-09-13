@@ -54,12 +54,11 @@ def test_parts():
 
 
 def test_tracker_ids():
-    trk = MultiObjectTracker()
+    det = SemanticDetector(backend="cv-cascade")
     f1 = _synthetic_car()
-    dets = SemanticDetector(backend="cv-cascade").detect(f1)
-    r1 = trk.update(dets)
+    r1 = det.detect_and_track(f1)
     # Same frame -> same stable ids.
-    r2 = trk.update(dets)
+    r2 = det.detect_and_track(f1)
     ids1 = sorted(o["id"] for o in r1)
     ids2 = sorted(o["id"] for o in r2)
     assert ids1 == ids2, f"ids changed between identical frames: {ids1} vs {ids2}"
